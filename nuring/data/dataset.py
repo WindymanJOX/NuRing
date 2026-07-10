@@ -11,12 +11,14 @@ from torch.utils.data import Dataset
 
 from .label_utils import (
     build_feature_crop,
+    confidence_from_marker_ring,
     crop_with_pad,
     instance_centroid,
     instance_ids,
     matched_cell_id,
     pseudo_cell_mask,
     radial_boundary_from_polar_mask,
+    select_feature_channels,
 )
 from .polar_transform import cartesian_to_polar_tensor
 
@@ -211,6 +213,10 @@ class NuRingDataset(Dataset):
         num_angles: int = 128,
         pseudo_label: str = "dilation",
         max_instances_per_image: Optional[int] = None,
+        input_mode: str = "all",
+        gap_tolerance: int = 2,
+        median_filter_size: int = 5,
+        min_radius: float = 3.0,
     ) -> None:
         self.image_dir = Path(image_dir)
         self.nucleus_dir = Path(nucleus_dir)
@@ -221,6 +227,10 @@ class NuRingDataset(Dataset):
         self.num_radial_bins = int(num_radial_bins)
         self.num_angles = int(num_angles)
         self.pseudo_label = pseudo_label
+        self.input_mode = input_mode
+        self.gap_tolerance = int(gap_tolerance)
+        self.median_filter_size = int(median_filter_size)
+        self.min_radius = float(min_radius)
 
         names = self._discover_names(sample_list, image_suffix)
         self.records = [
@@ -276,7 +286,9 @@ class NuRingDataset(Dataset):
         image_crop = crop_with_pad(image, center, self.crop_size, fill=0)
         nucleus_crop = crop_with_pad(nuclei, center, self.crop_size, fill=0)
         tissue_crop = crop_with_pad(tissue, center, self.crop_size, fill=0) if tissue is not None else None
-        features = build_feature_crop(image_crop, nucleus_crop, inst_id, tissue_crop)
+        features_all = build_feature_crop(image_crop, nucleus_crop, inst_id, tissue_crop)
+        raw_channels = image_crop.shape[0]
+        features = select_feature_channels(features_all, raw_channels, self.input_mode)
 
         target_nucleus = (nucleus_crop == inst_id).astype(np.uint8)
         if cell is not None:
@@ -287,16 +299,32 @@ class NuRingDataset(Dataset):
             cell_crop = pseudo_cell_mask(nucleus_crop, inst_id, radius=max(4, self.crop_size // 12), mode=self.pseudo_label)
 
         x_cart = torch.from_numpy(features).unsqueeze(0).float()
+        marker_sum_cart = torch.from_numpy(features_all[raw_channels][None, None].astype(np.float32))
         y_cart = torch.from_numpy(cell_crop[None, None].astype(np.float32))
         target_cart = torch.from_numpy(target_nucleus[None, None].astype(np.float32))
         neighbor_cart = torch.from_numpy((((nucleus_crop > 0) & (nucleus_crop != inst_id))[None, None]).astype(np.float32))
 
         x_polar = cartesian_to_polar_tensor(x_cart, self.num_radial_bins, self.num_angles, self.max_radius).squeeze(0)
+        marker_sum_polar = cartesian_to_polar_tensor(marker_sum_cart, self.num_radial_bins, self.num_angles, self.max_radius).squeeze(0)
         y_polar = cartesian_to_polar_tensor(y_cart, self.num_radial_bins, self.num_angles, self.max_radius, mode="nearest").squeeze(0)
         target_polar = cartesian_to_polar_tensor(target_cart, self.num_radial_bins, self.num_angles, self.max_radius, mode="nearest").squeeze(0)
         neighbor_polar = cartesian_to_polar_tensor(neighbor_cart, self.num_radial_bins, self.num_angles, self.max_radius, mode="nearest").squeeze(0)
-        y_radius = torch.from_numpy(radial_boundary_from_polar_mask(y_polar[0].numpy(), self.max_radius))
-        y_conf = (y_radius > 0).float()
+        y_radius_np = radial_boundary_from_polar_mask(
+            y_polar[0].numpy(),
+            self.max_radius,
+            gap_tolerance=self.gap_tolerance,
+            median_filter_size=self.median_filter_size,
+            min_radius=self.min_radius,
+        )
+        y_conf_np = confidence_from_marker_ring(
+            marker_sum_polar[0].numpy(),
+            y_polar[0].numpy(),
+            target_polar[0].numpy(),
+            y_radius_np,
+            self.max_radius,
+        )
+        y_radius = torch.from_numpy(y_radius_np)
+        y_conf = torch.from_numpy(y_conf_np)
 
         return {
             "x_polar": x_polar.float(),
@@ -306,6 +334,7 @@ class NuRingDataset(Dataset):
             "target_nucleus_polar": target_polar.float(),
             "neighbor_nuclei_polar": neighbor_polar.float(),
             "sample_name": rec.name,
+            "sample_id": rec.name,
             "instance_id": int(inst_id),
             "center_xy": torch.tensor(center, dtype=torch.float32),
         }
@@ -340,5 +369,5 @@ def export_tissuenet_to_npy(npz_path: str, out_dir: str) -> None:
         if img.ndim == 3 and img.shape[-1] <= 64:
             img = np.moveaxis(img, -1, 0)
         np.save(out / "images" / f"{i:06d}.npy", img.astype(np.float32))
-        np.save(out / "nuclei" / f"{i:06d}.npy", y[i, ..., 0].astype(np.int32))
-        np.save(out / "cells" / f"{i:06d}.npy", y[i, ..., 1].astype(np.int32))
+        np.save(out / "nuclei" / f"{i:06d}.npy", y[i, ..., 1].astype(np.int32))
+        np.save(out / "cells" / f"{i:06d}.npy", y[i, ..., 0].astype(np.int32))

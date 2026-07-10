@@ -134,33 +134,71 @@ python scripts/export_tissuenet.py \
   --train-limit 64 --val-limit 16 --test-limit 16
 ```
 
-Run baseline comparison and loss ablations:
+Run a smoke test baseline comparison and loss/fusion ablations:
 
 ```bash
 python scripts/run_tissuenet_experiments.py \
   --export-dir /data/wzx/tissuenet_v1.1/nuring_export_exp64 \
-  --work-dir runs/tissuenet_exp64 \
+  --work-dir runs/tissuenet_fix_exp64 \
   --epochs 3 --batch-size 32 --num-workers 4 \
   --device cuda --base-channels 16 --max-instances-per-image 64
 ```
 
 This runs:
 
-- NuRing full loss
-- mask-only ablation
-- mask + radius without shape/containment/neighbor losses
-- full loss without neighbor exclusion
+- loss ablations: mask-only, mask+radius, mask+radius+confidence, mask+radius+confidence+smooth, full
+- inference fusion ablations on the full checkpoint: `mask_only`, `mask_radius_average`, `confidence_fusion`
+- optional input ablations with `--input-ablation`
 - dilation, Voronoi, and watershed baselines
 
 Summarize the results:
 
 ```bash
 python scripts/summarize_experiments.py \
-  --work-dir runs/tissuenet_exp64 \
-  --train-count 64 --val-count 16 --test-count 16 --epochs 3
+  --work-dir runs/tissuenet_fix_exp64 \
+  --train-count 64 --val-count 16 --test-count 16 --epochs 3 \
+  --experiment-kind smoke
 ```
 
-The experiment writes checkpoints, predictions, metric CSVs, `summary.json`, and `report.md` under `runs/tissuenet_exp64`.
+The 64/16/16, 3-epoch setting is a smoke test only. It validates that the radius/confidence training and inference loop is connected, but it is not a formal method conclusion.
+
+For a formal experiment, use image-level splits with substantially more samples and training:
+
+```bash
+python scripts/export_tissuenet.py \
+  --tissuenet-dir /data/wzx/tissuenet_v1.1 \
+  --out-dir /data/wzx/tissuenet_v1.1/nuring_export_full
+
+python scripts/run_tissuenet_experiments.py \
+  --export-dir /data/wzx/tissuenet_v1.1/nuring_export_full \
+  --work-dir runs/tissuenet_formal \
+  --epochs 50 --batch-size 32 --num-workers 8 \
+  --device cuda --base-channels 32 --max-instances-per-image 128 \
+  --input-ablation
+```
+
+Each experiment writes checkpoints, predictions, metric CSVs, `summary.json`, and `report.md` under its work directory.
+
+## Radius/Confidence Fusion Fix
+
+The original inference path used only `mask_logits`, so the trained radius and confidence heads did not affect final whole-cell masks. The fixed inference path supports:
+
+- `mask_only`: polar mask branch only.
+- `mask_radius_average`: average mask probability and soft radius prior.
+- `confidence_fusion`: `confidence * radius_prior + (1 - confidence) * mask_prob`.
+
+`radius_to_soft_polar_mask()` builds the radius prior. Confidence is now supervised from marker evidence in the nucleus-to-cell ring region. Radius and smoothness losses are computed on normalized radius, and the default shape losses are reduced to avoid dominating the mask branch.
+
+Debug visualization:
+
+```bash
+python scripts/debug_visualize_nuring.py \
+  --checkpoint runs/tissuenet_fix_exp64/models/nuring_full/best.pt \
+  --image /data/wzx/tissuenet_v1.1/nuring_export_exp64/test/images/test_000000.npy \
+  --nucleus /data/wzx/tissuenet_v1.1/nuring_export_exp64/test/nuclei/test_000000.npy \
+  --cell /data/wzx/tissuenet_v1.1/nuring_export_exp64/test/cells/test_000000.npy \
+  --out runs/tissuenet_fix_exp64/debug_test_000000.png
+```
 
 ## Visualization
 

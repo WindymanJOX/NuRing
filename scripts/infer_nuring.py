@@ -15,8 +15,8 @@ import yaml
 from tqdm import tqdm
 
 from nuring.data.dataset import ensure_chw, load_array
-from nuring.data.label_utils import build_feature_crop, crop_with_pad, instance_centroid, instance_ids
-from nuring.data.polar_transform import cartesian_to_polar_tensor, polar_to_cartesian_mask
+from nuring.data.label_utils import build_feature_crop, crop_with_pad, instance_centroid, instance_ids, select_feature_channels
+from nuring.data.polar_transform import cartesian_to_polar_tensor, fuse_polar_prediction, polar_to_cartesian_mask
 from nuring.models import PolarRingNet
 from nuring.postprocess.assignment import assign_instances
 
@@ -31,8 +31,19 @@ def load_model(checkpoint: str, device: torch.device) -> tuple[PolarRingNet, dic
     return model, cfg
 
 
-def infer_one(image_path: Path, nucleus_path: Path, model: PolarRingNet, cfg: dict, device: torch.device, threshold: float) -> np.ndarray:
+def infer_one(
+    image_path: Path,
+    nucleus_path: Path,
+    model: PolarRingNet,
+    cfg: dict,
+    device: torch.device,
+    threshold: float,
+    fusion_mode: str,
+    radius_sigma: float,
+    radius_prior_weight: float,
+) -> np.ndarray:
     model_cfg = cfg["model"]
+    data_cfg = cfg.get("data", {})
     image = ensure_chw(load_array(image_path)).astype(np.float32)
     nuclei = load_array(nucleus_path).astype(np.int32)
     h, w = nuclei.shape
@@ -43,12 +54,23 @@ def infer_one(image_path: Path, nucleus_path: Path, model: PolarRingNet, cfg: di
         center = instance_centroid(nuclei, int(inst_id))
         image_crop = crop_with_pad(image, center, model_cfg["crop_size"], fill=0)
         nucleus_crop = crop_with_pad(nuclei, center, model_cfg["crop_size"], fill=0)
-        features = build_feature_crop(image_crop, nucleus_crop, int(inst_id))
+        features_all = build_feature_crop(image_crop, nucleus_crop, int(inst_id))
+        features = select_feature_channels(features_all, image_crop.shape[0], data_cfg.get("input_mode", "all"))
         x = torch.from_numpy(features).unsqueeze(0).float().to(device)
         x_polar = cartesian_to_polar_tensor(x, model_cfg["num_radial_bins"], model_cfg["num_angles"], model_cfg["max_radius"])
         with torch.no_grad():
             out = model(x_polar)
-            polar_prob = torch.sigmoid(out["mask_logits"])
+            mask_prob = torch.sigmoid(out["mask_logits"])
+            polar_prob = fuse_polar_prediction(
+                mask_prob,
+                out["radius"],
+                out["confidence"],
+                model_cfg["num_radial_bins"],
+                model_cfg["max_radius"],
+                mode=fusion_mode,
+                radius_sigma=radius_sigma,
+                radius_prior_weight=radius_prior_weight,
+            )
             cart_prob = polar_to_cartesian_mask(polar_prob, model_cfg["crop_size"], model_cfg["max_radius"])
         prob_crops.append(cart_prob.squeeze().detach().cpu().numpy())
         ids.append(int(inst_id))
@@ -80,11 +102,15 @@ def main() -> None:
     parser.add_argument("--sample-list")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--fusion-mode", choices=["mask_only", "mask_radius_average", "confidence_fusion"])
+    parser.add_argument("--radius-sigma", type=float)
+    parser.add_argument("--radius-prior-weight", type=float)
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     model, cfg = load_model(args.checkpoint, device)
     data_cfg = cfg["data"]
+    infer_cfg = cfg.get("infer", {})
     image_dir = Path(args.image_dir or data_cfg["image_dir"])
     nucleus_dir = Path(args.nucleus_dir or data_cfg["nucleus_dir"])
     out_dir = Path(args.output_dir)
@@ -104,6 +130,9 @@ def main() -> None:
             cfg,
             device,
             args.threshold,
+            args.fusion_mode or infer_cfg.get("fusion_mode", "confidence_fusion"),
+            args.radius_sigma if args.radius_sigma is not None else float(infer_cfg.get("radius_sigma", 2.0)),
+            args.radius_prior_weight if args.radius_prior_weight is not None else float(infer_cfg.get("radius_prior_weight", 0.5)),
         )
         np.save(out_dir / f"{name}_pred.npy", pred.astype(np.int32))
 

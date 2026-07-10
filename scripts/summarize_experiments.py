@@ -24,6 +24,7 @@ def main() -> None:
     parser.add_argument("--val-count", type=int)
     parser.add_argument("--test-count", type=int)
     parser.add_argument("--epochs", type=int)
+    parser.add_argument("--experiment-kind", choices=["smoke", "formal"], default="smoke")
     parser.add_argument("--out")
     args = parser.parse_args()
 
@@ -35,6 +36,10 @@ def main() -> None:
         lines.append(f"- TissueNet split: train={args.train_count}, val={args.val_count}, test={args.test_count}")
     if args.epochs is not None:
         lines.append(f"- NuRing epochs: {args.epochs}")
+    if args.experiment_kind == "smoke":
+        lines.append("- Experiment kind: smoke test; use this to validate code paths, not as a final method conclusion.")
+    else:
+        lines.append("- Experiment kind: formal experiment.")
     lines.extend(
         [
             f"- Work dir: `{work}`",
@@ -68,10 +73,12 @@ def main() -> None:
             "",
             "## Notes",
             "",
-            "- `nuring_full` uses mask, radius, smoothness, nucleus containment, and neighbor exclusion losses.",
-            "- `ablate_mask_only` disables radius, smoothness, containment, and neighbor losses.",
-            "- `ablate_no_shape` keeps mask + radius but disables smoothness, containment, and neighbor losses.",
-            "- `ablate_no_neighbor` disables only neighbor exclusion.",
+            "- `loss_mask_only` trains and infers with only the polar mask branch.",
+            "- `loss_mask_radius` adds normalized radius supervision and uses mask/radius average at inference.",
+            "- `loss_mask_radius_conf` adds confidence supervision and uses confidence fusion.",
+            "- `loss_mask_radius_conf_smooth` adds normalized circular smoothness.",
+            "- `nuring_full` adds containment and neighbor exclusion with reduced default weights.",
+            "- `fusion_mask_only`, `fusion_mask_radius_average`, and `fusion_confidence_fusion` evaluate the same full checkpoint with different inference fusion modes.",
             "- Baselines use nucleus dilation, Voronoi nearest-nucleus assignment, and watershed.",
         ]
     )

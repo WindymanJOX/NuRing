@@ -30,7 +30,14 @@ def summarize_csv(csv_path: Path) -> dict[str, float]:
         return summary
     keys = [k for k in rows[0].keys() if k != "sample"]
     for key in keys:
-        vals = [float(r[key]) for r in rows if r.get(key) not in {"", None}]
+        vals = []
+        for r in rows:
+            if r.get(key) in {"", None}:
+                continue
+            try:
+                vals.append(float(r[key]))
+            except ValueError:
+                continue
         if vals:
             summary[key] = float(np.mean(vals))
     return summary
@@ -47,6 +54,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--base-channels", type=int, default=16)
     parser.add_argument("--max-instances-per-image", type=int, default=96)
+    parser.add_argument("--input-ablation", action="store_true")
     parser.add_argument("--skip-train", action="store_true")
     args = parser.parse_args()
 
@@ -73,12 +81,36 @@ def main() -> None:
         "--max-instances-per-image", str(args.max_instances_per_image),
     ]
     variants = {
-        "nuring_full": {},
-        "ablate_mask_only": {"--lambda-radius": "0", "--lambda-smooth": "0", "--lambda-contain": "0", "--lambda-neighbor": "0"},
-        "ablate_no_shape": {"--lambda-smooth": "0", "--lambda-contain": "0", "--lambda-neighbor": "0"},
-        "ablate_no_neighbor": {"--lambda-neighbor": "0"},
+        "loss_mask_only": {
+            "train": {"--lambda-radius": "0", "--lambda-conf": "0", "--lambda-smooth": "0", "--lambda-contain": "0", "--lambda-neighbor": "0"},
+            "fusion": "mask_only",
+        },
+        "loss_mask_radius": {
+            "train": {"--lambda-conf": "0", "--lambda-smooth": "0", "--lambda-contain": "0", "--lambda-neighbor": "0"},
+            "fusion": "mask_radius_average",
+        },
+        "loss_mask_radius_conf": {
+            "train": {"--lambda-smooth": "0", "--lambda-contain": "0", "--lambda-neighbor": "0"},
+            "fusion": "confidence_fusion",
+        },
+        "loss_mask_radius_conf_smooth": {
+            "train": {"--lambda-contain": "0", "--lambda-neighbor": "0"},
+            "fusion": "confidence_fusion",
+        },
+        "nuring_full": {"train": {}, "fusion": "confidence_fusion"},
     }
-    for name, overrides in variants.items():
+    if args.input_ablation:
+        variants.update(
+            {
+                "input_dapi_only": {"train": {"--input-mode": "dapi_only"}, "fusion": "confidence_fusion"},
+                "input_dapi_marker_sum": {"train": {"--input-mode": "dapi_marker_sum"}, "fusion": "confidence_fusion"},
+                "input_dapi_marker_max": {"train": {"--input-mode": "dapi_marker_max"}, "fusion": "confidence_fusion"},
+                "input_all_markers": {"train": {"--input-mode": "all_markers"}, "fusion": "confidence_fusion"},
+                "input_all_plus_neighbor": {"train": {"--input-mode": "all_plus_neighbor"}, "fusion": "confidence_fusion"},
+            }
+        )
+    for name, variant in variants.items():
+        overrides = variant["train"]
         run_dir = work / "models" / name
         if not args.skip_train:
             cmd = [sys.executable, "scripts/train_nuring.py", *train_args, "--save-dir", str(run_dir)]
@@ -102,6 +134,8 @@ def main() -> None:
                 str(pred_dir),
                 "--device",
                 args.device,
+                "--fusion-mode",
+                variant["fusion"],
             ],
             logs / f"infer_{name}.log",
         )
@@ -122,6 +156,51 @@ def main() -> None:
             logs / f"eval_{name}.log",
         )
         summary[name] = summarize_csv(csv_path)
+
+    full_ckpt = work / "models" / "nuring_full" / "best.pt"
+    if full_ckpt.exists():
+        for fusion_mode in ["mask_only", "mask_radius_average", "confidence_fusion"]:
+            name = f"fusion_{fusion_mode}"
+            pred_dir = pred_root / name
+            run(
+                [
+                    sys.executable,
+                    "scripts/infer_nuring.py",
+                    "--checkpoint",
+                    str(full_ckpt),
+                    "--image-dir",
+                    str(test / "images"),
+                    "--nucleus-dir",
+                    str(test / "nuclei"),
+                    "--sample-list",
+                    str(test / "samples.txt"),
+                    "--output-dir",
+                    str(pred_dir),
+                    "--device",
+                    args.device,
+                    "--fusion-mode",
+                    fusion_mode,
+                ],
+                logs / f"infer_{name}.log",
+            )
+            csv_path = metrics_dir / f"{name}.csv"
+            run(
+                [
+                    sys.executable,
+                    "scripts/evaluate.py",
+                    "--pred-dir",
+                    str(pred_dir),
+                    "--gt-dir",
+                    str(test / "cells"),
+                    "--nucleus-dir",
+                    str(test / "nuclei"),
+                    "--output-csv",
+                    str(csv_path),
+                    "--crowded-analysis",
+                ],
+                logs / f"eval_{name}.log",
+            )
+            summary[name] = summarize_csv(csv_path)
 
     for method, radius in [("dilation", "10"), ("voronoi", "32"), ("watershed", "32")]:
         out_dir = pred_root / "baselines" / method

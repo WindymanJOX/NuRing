@@ -8,6 +8,7 @@ data:
   image_suffix: .npy
   nucleus_suffix: .npy
   pseudo_label: dilation
+  input_mode: all
 
 model:
   input_channels:
@@ -29,12 +30,29 @@ train:
 
 loss:
   lambda_mask: 1.0
-  lambda_radius: 1.0
-  lambda_smooth: 0.05
-  lambda_contain: 0.5
-  lambda_neighbor: 0.5
+  lambda_radius: 0.05
+  lambda_conf: 0.1
+  lambda_smooth: 0.005
+  lambda_contain: 0.05
+  lambda_neighbor: 0.05
+  max_radius: 64
+
+label:
+  gap_tolerance: 2
+  median_filter_size: 5
+  min_radius: 3
+
+split:
+  mode: image
+  train_ratio: 0.9
+  val_ratio: 0.1
+  test_ratio: 0.0
+  seed: 42
 
 infer:
   checkpoint: runs/nuring/best.pt
   output_dir: outputs/nuring
   threshold: 0.5
+  fusion_mode: confidence_fusion
+  radius_sigma: 2.0
+  radius_prior_weight: 0.5

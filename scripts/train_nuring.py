@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 import yaml
 
@@ -40,6 +40,44 @@ def move_batch(batch: dict, device: torch.device) -> dict:
     return out
 
 
+def split_indices_by_sample(dataset: NuRingDataset, split_cfg: dict) -> tuple[list[int], list[int], dict]:
+    """Split cell-crop indices by image/sample id to avoid leakage."""
+
+    mode = split_cfg.get("mode", "image")
+    seed = int(split_cfg.get("seed", 42))
+    if mode != "image" or len(dataset.records) <= 1:
+        indices = list(range(len(dataset)))
+        val_len = max(1, int(0.1 * len(indices))) if len(indices) > 10 else 0
+        train_indices = indices[:-val_len] if val_len else indices
+        val_indices = indices[-val_len:] if val_len else []
+        return train_indices, val_indices, {"mode": "instance_fallback", "train_indices": len(train_indices), "val_indices": len(val_indices)}
+
+    sample_to_indices: dict[str, list[int]] = {}
+    for idx, (rec_i, _inst_id) in enumerate(dataset.index):
+        sample = dataset.records[rec_i].name
+        sample_to_indices.setdefault(sample, []).append(idx)
+    samples = sorted(sample_to_indices)
+    rng = random.Random(seed)
+    rng.shuffle(samples)
+    val_ratio = float(split_cfg.get("val_ratio", 0.1))
+    val_count = int(round(len(samples) * val_ratio))
+    if val_ratio > 0 and val_count == 0 and len(samples) > 1:
+        val_count = 1
+    val_samples = set(samples[:val_count])
+    train_samples = set(samples[val_count:])
+    train_indices = [i for s in sorted(train_samples) for i in sample_to_indices[s]]
+    val_indices = [i for s in sorted(val_samples) for i in sample_to_indices[s]]
+    assert not train_samples & val_samples, "image-level split leaked samples"
+    return train_indices, val_indices, {
+        "mode": "image",
+        "seed": seed,
+        "train_samples": sorted(train_samples),
+        "val_samples": sorted(val_samples),
+        "train_indices": len(train_indices),
+        "val_indices": len(val_indices),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
@@ -56,9 +94,11 @@ def main() -> None:
     parser.add_argument("--base-channels", type=int)
     parser.add_argument("--lambda-mask", type=float)
     parser.add_argument("--lambda-radius", type=float)
+    parser.add_argument("--lambda-conf", type=float)
     parser.add_argument("--lambda-smooth", type=float)
     parser.add_argument("--lambda-contain", type=float)
     parser.add_argument("--lambda-neighbor", type=float)
+    parser.add_argument("--input-mode")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -66,6 +106,8 @@ def main() -> None:
     model_cfg = cfg["model"]
     train_cfg = cfg["train"]
     loss_cfg = cfg["loss"]
+    label_cfg = cfg.get("label", {})
+    split_cfg = cfg.get("split", {})
     for key in ["image_dir", "nucleus_dir", "cell_dir"]:
         val = getattr(args, key.replace("_", "-"), None)
         if val:
@@ -90,10 +132,13 @@ def main() -> None:
         train_cfg["num_workers"] = args.num_workers
     if args.base_channels:
         model_cfg["base_channels"] = args.base_channels
-    for key in ["lambda_mask", "lambda_radius", "lambda_smooth", "lambda_contain", "lambda_neighbor"]:
+    if args.input_mode:
+        data_cfg["input_mode"] = args.input_mode
+    for key in ["lambda_mask", "lambda_radius", "lambda_conf", "lambda_smooth", "lambda_contain", "lambda_neighbor"]:
         val = getattr(args, key)
         if val is not None:
             loss_cfg[key] = val
+    loss_cfg["max_radius"] = model_cfg["max_radius"]
 
     seed_all(int(train_cfg.get("seed", 7)))
     device = torch.device(train_cfg["device"] if torch.cuda.is_available() or train_cfg["device"] == "cpu" else "cpu")
@@ -114,10 +159,16 @@ def main() -> None:
         num_angles=model_cfg["num_angles"],
         pseudo_label=data_cfg.get("pseudo_label", "dilation"),
         max_instances_per_image=args.max_instances_per_image,
+        input_mode=data_cfg.get("input_mode", "all"),
+        gap_tolerance=label_cfg.get("gap_tolerance", 2),
+        median_filter_size=label_cfg.get("median_filter_size", 5),
+        min_radius=label_cfg.get("min_radius", 3),
     )
-    val_len = max(1, int(0.1 * len(dataset))) if len(dataset) > 10 else 0
-    train_len = len(dataset) - val_len
-    train_set, val_set = random_split(dataset, [train_len, val_len]) if val_len else (dataset, None)
+
+    train_indices, val_indices, split_meta = split_indices_by_sample(dataset, split_cfg)
+    (save_dir / "split.json").write_text(json.dumps(split_meta, indent=2), encoding="utf-8")
+    train_set = Subset(dataset, train_indices)
+    val_set = Subset(dataset, val_indices) if val_indices else None
     train_loader = DataLoader(train_set, batch_size=train_cfg["batch_size"], shuffle=True, num_workers=train_cfg["num_workers"], pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=train_cfg["batch_size"], shuffle=False, num_workers=train_cfg["num_workers"], pin_memory=True) if val_set else None
 
@@ -141,7 +192,7 @@ def main() -> None:
             losses["loss"].backward()
             optimizer.step()
             train_loss += float(losses["loss"].item())
-            pbar.set_postfix(loss=f"{losses['loss'].item():.4f}", mask=f"{losses['mask'].item():.4f}", rad=f"{losses['radius'].item():.3f}")
+            pbar.set_postfix(loss=f"{losses['loss'].item():.4f}", mask=f"{losses['mask'].item():.4f}", rad=f"{losses['radius'].item():.3f}", conf=f"{losses['conf'].item():.3f}")
         train_loss /= max(len(train_loader), 1)
 
         val_loss = train_loss
