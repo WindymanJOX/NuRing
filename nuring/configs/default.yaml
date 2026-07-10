@@ -1,0 +1,40 @@
+data:
+  image_dir: /data/wzx/TLS/mIF50/registered
+  nucleus_dir: /data/wzx/TLS/mIF50/nucleiseg
+  cell_dir:
+  tissue_dir:
+  tissuenet_dir: /data/wzx/tissuenet_v1.1
+  sample_list:
+  image_suffix: .npy
+  nucleus_suffix: .npy
+  pseudo_label: dilation
+
+model:
+  input_channels:
+  base_channels: 32
+  crop_size: 128
+  max_radius: 64
+  num_radial_bins: 64
+  num_angles: 128
+
+train:
+  batch_size: 16
+  epochs: 100
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  num_workers: 4
+  device: cuda
+  seed: 7
+  save_dir: runs/nuring
+
+loss:
+  lambda_mask: 1.0
+  lambda_radius: 1.0
+  lambda_smooth: 0.05
+  lambda_contain: 0.5
+  lambda_neighbor: 0.5
+
+infer:
+  checkpoint: runs/nuring/best.pt
+  output_dir: outputs/nuring
+  threshold: 0.5
